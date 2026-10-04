@@ -65,10 +65,21 @@ def get_google_api_key() -> str:
 
 
 def get_gemini_model() -> str:
-    """Return the configured Gemini model name, defaulting to a stable flash model."""
-    value = _read_secret_value("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash"
-    cleaned = str(value).strip()
-    return cleaned or "gemini-2.0-flash"
+    """Return the preferred Gemini model, preferring the current API-recommended 3.8 model."""
+    candidates = get_gemini_model_candidates()
+    return candidates[0] if candidates else "gemini-3.8-flash"
+
+
+def get_gemini_model_candidates() -> list[str]:
+    """Return ordered Gemini model candidates with the current API-recommended model first."""
+    configured = (_read_secret_value("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "").strip()
+    preferred = [configured] if configured else []
+    fallback = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    candidates = []
+    for model_name in preferred + fallback:
+        if model_name and model_name not in candidates:
+            candidates.append(model_name)
+    return candidates or ["gemini-3.8-flash"]
 
 
 
@@ -234,20 +245,37 @@ def ask_gemini(question: str, image_file=None, mode: str = "styling") -> str:
 
     parts.append(types.Part.from_text(text=f"User question: {question}"))
 
-    try:
-        response = _call_gemini_with_retry(client, model_name, parts)
-        return extract_text(response)
-    except Exception as exc:
-        details = str(exc)
-        if "429" in details or "quota" in details.lower() or "resource_exhausted" in details.lower():
+    model_candidates = get_gemini_model_candidates()
+    last_exc = None
+
+    for model_name in model_candidates:
+        try:
+            response = _call_gemini_with_retry(client, model_name, parts)
+            return extract_text(response)
+        except Exception as exc:
+            last_exc = exc
+            details = str(exc)
+            if "404" in details or "NOT_FOUND" in details.upper() or "not found for API version" in details.lower():
+                continue
+            if "429" in details or "quota" in details.lower() or "resource_exhausted" in details.lower():
+                return (
+                    "The Gemini API is currently rate-limited or quota-exhausted. Please wait a moment and try again. "
+                    f"Technical details: {details}"
+                )
             return (
-                "The Gemini API is currently rate-limited or quota-exhausted. Please wait a moment and try again. "
-                f"Technical details: {details}"
+                "Sorry, I could not generate a response right now. The Gemini service may be busy or temporarily unavailable. "
+                f"Please try again in a moment. Technical details: {details}"
             )
+
+    if last_exc is not None:
+        details = str(last_exc)
         return (
-            "Sorry, I could not generate a response right now. The Gemini service may be busy or temporarily unavailable. "
-            f"Please try again in a moment. Technical details: {details}"
+            "None of the configured Gemini model names were available for this API version. "
+            "Please use a supported model like gemini-2.5-flash or gemini-2.0-flash. "
+            f"Technical details: {details}"
         )
+
+    return "Sorry, I could not generate a response right now."
 
 
 if "chat_history" not in st.session_state:
