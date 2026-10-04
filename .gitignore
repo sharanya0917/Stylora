@@ -1,6 +1,25 @@
+# Local environment and secret files
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.secret
+*.token
+credentials.json
+service-account*.json
+
+# Streamlit secrets (app reads these locations)
+.streamlit/
 .streamlit/secrets.toml
+streamlit/secrets.toml
+secrets.toml
+
+# Local virtual environments and build artifacts
+.venv/
+.venv-1/
 venv/
 __pycache__/
-*.pyc
-
-streamlit/
+.pytest_cache/

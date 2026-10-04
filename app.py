@@ -1,5 +1,7 @@
+import base64
 import os
 import re
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -13,12 +15,12 @@ from prompts import STYLORA_SYSTEM_PROMPT
 
 st.set_page_config(page_title="Stylora", page_icon="👗", layout="wide")
 
-def get_google_api_key() -> str:
-    """Try Streamlit secrets, local secret files, and environment variables."""
+def _read_secret_value(key_name: str) -> str:
+    """Read a secret from Streamlit, local files, or environment variables."""
     try:
-        key = st.secrets.get("GOOGLE_API_KEY")
-        if key:
-            return str(key)
+        value = st.secrets.get(key_name)
+        if value:
+            return str(value)
     except Exception:
         pass
 
@@ -38,23 +40,36 @@ def get_google_api_key() -> str:
 
             with secret_path.open("rb") as f:
                 data = tomllib.load(f)
-            key = data.get("GOOGLE_API_KEY")
-            if key:
-                return str(key)
+            value = data.get(key_name)
+            if value:
+                return str(value)
         except Exception:
             pass
 
         try:
             raw_text = secret_path.read_text(encoding="utf-8", errors="ignore")
-            match = re.search(r'GOOGLE_API_KEY\s*=\s*["\']?([^"\n\r]+)["\']?', raw_text)
+            match = re.search(rf'{re.escape(key_name)}\s*=\s*["\']?([^"\n\r]+)["\']?', raw_text)
             if match:
-                key = match.group(1).strip()
-                if key:
-                    return str(key)
+                value = match.group(1).strip()
+                if value:
+                    return str(value)
         except Exception:
             pass
 
-    return str(os.getenv("GOOGLE_API_KEY") or "")
+    return str(os.getenv(key_name) or "")
+
+
+def get_google_api_key() -> str:
+    """Try Streamlit secrets, local secret files, and environment variables."""
+    return _read_secret_value("GOOGLE_API_KEY")
+
+
+def get_gemini_model() -> str:
+    """Return the configured Gemini model name, defaulting to a stable flash model."""
+    value = _read_secret_value("GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash"
+    cleaned = str(value).strip()
+    return cleaned or "gemini-2.0-flash"
+
 
 
 def extract_text(response):
@@ -100,13 +115,7 @@ def get_telegram_config() -> dict:
         "TELEGRAM_CHAT_ID",
         "ADMIN_CHAT_ID",
     ]:
-        value = ""
-        try:
-            value = st.secrets.get(key)
-        except Exception:
-            value = ""
-        if not value:
-            value = os.getenv(key, "")
+        value = _read_secret_value(key)
         if value and not _is_placeholder_value(value):
             config[key] = str(value).strip()
     return config
@@ -139,6 +148,40 @@ def send_telegram_message(message: str, chat_id: str = "") -> str:
         return f"Telegram send failed: {exc}"
 
 
+def _should_retry_gemini_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retry_tokens = [
+        "503",
+        "429",
+        "rate limit",
+        "resource_exhausted",
+        "temporarily unavailable",
+        "unavailable",
+        "timeout",
+        "busy",
+        "quota",
+        "overloaded",
+    ]
+    return any(token in message for token in retry_tokens)
+
+
+def _call_gemini_with_retry(client, model: str, contents, max_retries: int = 3):
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(model=model, contents=contents)
+        except Exception as exc:
+            last_exc = exc
+            if not _should_retry_gemini_error(exc) or attempt == max_retries - 1:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Gemini request failed without an exception payload.")
+
+
+ 
+
 def ask_gemini(question: str, image_file=None, mode: str = "styling") -> str:
     api_key = get_google_api_key()
     if not api_key:
@@ -147,6 +190,7 @@ def ask_gemini(question: str, image_file=None, mode: str = "styling") -> str:
             "`GOOGLE_API_KEY` environment variable before using Stylora."
         )
 
+    model_name = get_gemini_model()
     client = genai.Client(api_key=api_key)
 
     parts = [
@@ -191,12 +235,18 @@ def ask_gemini(question: str, image_file=None, mode: str = "styling") -> str:
     parts.append(types.Part.from_text(text=f"User question: {question}"))
 
     try:
-        response = client.models.generate_content(model="gemini-3.5-flash", contents=parts)
+        response = _call_gemini_with_retry(client, model_name, parts)
         return extract_text(response)
     except Exception as exc:
+        details = str(exc)
+        if "429" in details or "quota" in details.lower() or "resource_exhausted" in details.lower():
+            return (
+                "The Gemini API is currently rate-limited or quota-exhausted. Please wait a moment and try again. "
+                f"Technical details: {details}"
+            )
         return (
             "Sorry, I could not generate a response right now. The Gemini service may be busy or temporarily unavailable. "
-            f"Please try again in a moment. Error: {exc}"
+            f"Please try again in a moment. Technical details: {details}"
         )
 
 
@@ -234,6 +284,19 @@ telegram_cfg = get_telegram_config()
 st.sidebar.title("Stylora")
 st.sidebar.caption("Your image-based fashion styling assistant")
 st.sidebar.caption("Telegram bot: @StyloraFashionBot")
+
+with st.sidebar.expander("How to receive messages on Telegram", expanded=False):
+    st.markdown(
+        """
+        1. Open Telegram and search for @BotFather.
+        2. Send `/newbot`, choose a name, and copy the bot token it gives you.
+        3. Open @userinfobot and send `/start`.
+        4. Copy the numeric chat ID it replies with.
+        5. In this website, paste that chat ID into the Telegram chat ID field below the generated message.
+        6. Click "Send via Telegram" to receive the message in your chat.
+        """
+    )
+
 if not api_key:
     st.sidebar.info(
         "Add your Gemini API key in `.streamlit/secrets.toml` as `GOOGLE_API_KEY = \"...\"` or set the environment variable."
